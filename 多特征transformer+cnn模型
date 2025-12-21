@@ -89,24 +89,13 @@ class CNNTransformerModel(nn.Module):
 # 数据加载
 def load_public_data():
     data_path = "consumption.csv"
-    try:
-        if os.path.exists(data_path):
-            df = pd.read_csv(data_path, parse_dates=['date'], index_col='date')
-        else:
-            url = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/power_consumption_features.csv"
-            df = pd.read_csv(url, parse_dates=['date'], index_col='date')
-        
-        FEATURE_COLS = ['Temperature', 'Humidity', 'Wind Speed', 'general diffuse flows', 'diffuse flows']
-        TARGET_COL = 'Zone 3 Power Consumption'
-        
-        missing_cols = [col for col in FEATURE_COLS + [TARGET_COL] if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"缺失必要列：{missing_cols}")
-        
-        print("数据加载成功（含5个指定特征+Zone3电力消耗）")
-        return df[FEATURE_COLS + [TARGET_COL]]
-    except Exception as e:
-        raise RuntimeError(f"数据加载失败：{str(e)}")
+    df = pd.read_csv(data_path)
+    
+    df["DateTime"] = pd.to_datetime(df["DateTime"])  
+    df.set_index("DateTime", inplace=True)  
+    
+    df_daily_mean = df.resample('D').mean() 
+    return df_daily_mean
 
 # 探索性数据分析
 def exploratory_data_analysis(df):
@@ -125,7 +114,7 @@ def exploratory_data_analysis(df):
     
     # 目标变量时间序列图
     plt.figure(figsize=(15, 4))
-    plt.plot(df.index, df['Zone 3 Power Consumption'], color='#2E86AB', linewidth=1.5)
+    plt.plot(df.index, df['Zone 3  Power Consumption'], color='#2E86AB', linewidth=1.5)
     plt.title('Zone 3 电力消耗时间序列', fontsize=12, fontweight='bold')
     plt.xlabel('日期'), plt.ylabel('电力消耗 (kW)'), plt.grid(alpha=0.3)
     plt.tight_layout(), plt.savefig("results/target_time_series.png", dpi=300), plt.close()
@@ -147,7 +136,7 @@ def exploratory_data_analysis(df):
 # 数据预处理
 def preprocess_data(df):
     FEATURE_COLS = ['Temperature', 'Humidity', 'Wind Speed', 'general diffuse flows', 'diffuse flows']
-    TARGET_COL = 'Zone 3 Power Consumption'
+    TARGET_COL = 'Zone 3  Power Consumption'
     
     feat_data = df[FEATURE_COLS].values
     target_series = df[TARGET_COL].values
@@ -198,7 +187,7 @@ def inverse_transform(pred_scaled, target_scaler, original_target, seq_len, trai
     return prev_vals + pred_diff
 
 # 训练与调参
-def train_eval(params, prep_data, pred_len=1):
+def train_eval(prep_data, pred_len=1):
     print("\n" + "="*50)
     print("CNN-Transformer 训练与调参")
     print("="*50)
@@ -212,7 +201,7 @@ def train_eval(params, prep_data, pred_len=1):
         'kernel_size': [3, 5],
         'BATCH_SIZE': [16, 32],
         'LEARNING_RATE': [1e-4, 5e-4],
-        'epochs': 40
+        'epochs': [40]
     }
     
     # 生成有效参数组合
