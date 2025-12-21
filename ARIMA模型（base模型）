@@ -1,0 +1,270 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
+import matplotlib.pyplot as plt
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# 基础配置
+os.makedirs("results", exist_ok=True)
+plt.rcParams['font.sans-serif'] = ['Hiragino Sans GB', 'STHeiti', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 评估指标函数
+def calculate_mape(y_true, y_pred, eps=1e-8):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    y_true_safe = np.where(y_true == 0, eps, y_true)
+    mape = np.mean(np.abs((y_true_safe - y_pred) / y_true_safe)) * 100
+    return round(mape, 2)
+
+def calculate_metrics(y_true, y_pred):
+    mae = np.mean(np.abs(y_true - y_pred))
+    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+    mape = calculate_mape(y_true, y_pred)
+    return round(mae, 2), round(rmse, 2), mape
+
+# 核心类定义
+class ARIMATimeSeriesAnalyzer:
+    def __init__(self, data_path, target_col):
+        self.data_path = data_path
+        self.target_col = target_col
+        self.df = None
+        self.df_daily_mean = None
+        self.target_series = None
+        self.train_series = None
+        self.test_series = None
+        self.best_order = None
+        self.model = None
+        self.model_result = None
+
+    def load_and_preprocess(self):
+        """加载数据并预处理（日均值重采样）"""
+        try:
+            if not os.path.exists(self.data_path):
+                raise FileNotFoundError(f"数据文件不存在：{self.data_path}")
+            
+            self.df = pd.read_csv(self.data_path, parse_dates=['date'], index_col='date')
+            
+            # 检查目标列是否存在
+            if self.target_col not in self.df.columns:
+                raise ValueError(f"数据中缺失目标列：{self.target_col}")
+            
+            # 日均值重采样
+            self.df_daily_mean = self.df.resample('D').mean().dropna()
+            self.target_series = self.df_daily_mean[self.target_col].dropna()
+            
+            # 检查数据有效性
+            if len(self.target_series) < 30:
+                raise ValueError(f"有效数据不足30条，当前仅{len(self.target_series)}条")
+            
+            print(f"数据加载完成：序列长度={len(self.target_series)}, 数值范围=[{self.target_series.min():.2f}, {self.target_series.max():.2f}] kW")
+            return self
+        except Exception as e:
+            raise RuntimeError(f"数据加载失败：{str(e)}")
+
+    def split_train_test(self, train_ratio=0.8):
+        """时间顺序划分训练集/测试集"""
+        train_size = int(train_ratio * len(self.target_series))
+        self.train_series = self.target_series.iloc[:train_size]
+        self.test_series = self.target_series.iloc[train_size:]
+        print(f"训练集：{len(self.train_series)}条数据 | 测试集：{len(self.test_series)}条数据")
+        return self
+
+    def find_min_diff_order(self, max_diff=3):
+        """差分平稳化，寻找最小d阶"""
+        print("\n" + "="*60)
+        print("差分平稳化过程")
+        print("="*60)
+        
+        for d in range(max_diff + 1):
+            diff_series = self.train_series.diff(d).dropna() if d > 0 else self.train_series.copy()
+            if len(diff_series) < 10:
+                continue
+            
+            adf_result = adfuller(diff_series)
+            p_value = adf_result[1]
+            print(f"{d}阶差分后：数据量={len(diff_series)} | p值={p_value:.4f}")
+            
+            if p_value < 0.05:
+                print(f"→ 平稳（p<0.05），最小差分阶数d={d}")
+                return d
+        
+        print(f"警告：{max_diff}阶差分后仍非平稳，使用d={max_diff}")
+        return max_diff
+
+    def auto_select_pq(self, d, max_p=3, max_q=3):
+        """自动选择p、q阶数（基于AIC准则）"""
+        best_aic = float('inf')
+        best_pq = (0, 0)
+        
+        for p in range(max_p + 1):
+            for q in range(max_q + 1):
+                try:
+                    temp_model = ARIMA(self.train_series, order=(p, d, q))
+                    temp_result = temp_model.fit()
+                    if temp_result.aic < best_aic:
+                        best_aic = temp_result.aic
+                        best_pq = (p, q)
+                except:
+                    continue
+        
+        p, q = best_pq
+        self.best_order = (p, d, q)
+        print(f"\n自动定阶结果：p={p}, d={d}, q={q} | 最小AIC={best_aic:.2f}")
+        print(f"最终ARIMA模型：ARIMA{self.best_order}")
+        return self
+
+    def train_model(self):
+        """训练ARIMA模型"""
+        print("\n" + "="*60)
+        print(f"ARIMA{self.best_order} 模型训练")
+        print("="*60)
+        
+        try:
+            self.model = ARIMA(self.train_series, order=self.best_order)
+            self.model_result = self.model.fit()
+            
+            # 输出核心参数
+            print("\n模型核心参数：")
+            params_df = pd.DataFrame({
+                '参数名称': self.model_result.params.index[:5],  # 只显示前5个核心参数
+                '参数值': self.model_result.params.values[:5].round(4),
+                'p值': self.model_result.pvalues.values[:5].round(4)
+            })
+            print(params_df)
+            return self
+        except Exception as e:
+            raise RuntimeError(f"模型训练失败：{str(e)}")
+
+    def predict(self):
+        """训练集拟合+测试集预测"""
+        # 训练集内拟合
+        self.in_sample_pred = self.model_result.predict(
+            start=self.train_series.index[1],
+            end=self.train_series.index[-1],
+            typ='levels'
+        )
+        self.in_sample_ci = self.model_result.get_prediction(
+            start=self.train_series.index[1],
+            end=self.train_series.index[-1]
+        ).conf_int()
+        
+        # 测试集预测
+        test_forecast = self.model_result.get_forecast(steps=len(self.test_series))
+        self.test_pred = test_forecast.predicted_mean
+        self.test_ci = test_forecast.conf_int()
+        
+        return self
+
+    def evaluate(self):
+        """计算训练集和测试集误差"""
+        print("\n" + "="*60)
+        print("误差评估汇总")
+        print("="*60)
+        
+        # 训练集评估
+        train_true = self.train_series.loc[self.in_sample_pred.index]
+        self.train_mae, self.train_rmse, self.train_mape = calculate_metrics(
+            train_true.values, self.in_sample_pred.values
+        )
+        print(f"【训练集】")
+        print(f"有效拟合点数：{len(self.in_sample_pred)}")
+        print(f"MAE：{self.train_mae} kW | RMSE：{self.train_rmse} kW | MAPE：{self.train_mape}%")
+        
+        # 测试集评估
+        self.test_mae, self.test_rmse, self.test_mape = calculate_metrics(
+            self.test_series.values, self.test_pred.values
+        )
+        print(f"【测试集】")
+        print(f"预测点数：{len(self.test_pred)}")
+        print(f"MAE：{self.test_mae} kW | RMSE：{self.test_rmse} kW | MAPE：{self.test_mape}%")
+        return self
+
+    def plot_result(self):
+        """绘制训练集拟合+测试集预测结果"""
+        fig, ax = plt.subplots(figsize=(16, 8))
+        
+        # 绘制真实值
+        ax.plot(self.target_series.index, self.target_series, color='#FF6B6B', 
+                linewidth=2.5, label='真实值（区域3电力消耗）', alpha=0.8, marker='o', markersize=4)
+        
+        # 绘制训练集拟合
+        ax.plot(self.in_sample_pred.index, self.in_sample_pred, color='#45B7D1', 
+                linewidth=3, label=f'ARIMA{self.best_order} 训练集拟合')
+        ax.fill_between(self.in_sample_ci.index, 
+                        self.in_sample_ci.iloc[:, 0], self.in_sample_ci.iloc[:, 1],
+                        color='#45B7D1', alpha=0.25, label='训练集95%置信区间')
+        
+        # 绘制测试集预测
+        ax.plot(self.test_series.index, self.test_pred, linewidth=3, color='#96CEB4',
+                label=f'ARIMA{self.best_order} 测试集预测')
+        ax.fill_between(self.test_ci.index, 
+                        self.test_ci.iloc[:, 0], self.test_ci.iloc[:, 1],
+                        color='#96CEB4', alpha=0.25, label='测试集95%置信区间')
+        
+        # 分割线
+        ax.axvline(x=self.train_series.index[-1], color='black', linestyle=':', 
+                   linewidth=2, label='训练/测试集分割线')
+        
+        # 图表样式
+        ax.set_title('区域3电力消耗 - ARIMA模型 训练集拟合+测试集预测', 
+                     fontsize=18, fontweight='bold', pad=20)
+        ax.set_xlabel('日期', fontsize=14, fontweight='medium')
+        ax.set_ylabel('电力消耗 (kW)', fontsize=14, fontweight='medium')
+        ax.tick_params(axis='x', rotation=45, labelsize=12)
+        ax.tick_params(axis='y', labelsize=12)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        
+        # 坐标轴范围优化
+        y_min = self.target_series.min() * 0.95
+        y_max = self.target_series.max() * 1.05
+        x_min = self.target_series.index.min() - pd.Timedelta(days=1)
+        x_max = self.target_series.index.max() + pd.Timedelta(days=1)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlim(x_min, x_max)
+        
+        ax.legend(loc='upper right', fontsize=12, framealpha=0.9)
+        plt.tight_layout()
+        plt.savefig("results/arima_train_test_fitting.png", dpi=300, bbox_inches="tight")
+        plt.show()
+        print("\n可视化图表已保存至 results/arima_train_test_fitting.png")
+        return self
+
+# 主函数
+def main():
+    print("="*60)
+    print("区域3电力消耗ARIMA时间序列预测")
+    print("="*60)
+    
+    # 配置参数
+    DATA_PATH = "consumption.csv"
+    TARGET_COL = "Zone 3  Power Consumption"  
+    
+    try:
+        # 串联整个流程
+        analyzer = ARIMATimeSeriesAnalyzer(DATA_PATH, TARGET_COL)
+        analyzer.load_and_preprocess()\
+               .split_train_test()
+               
+        d = analyzer.find_min_diff_order()
+        analyzer.auto_select_pq(d)\
+               .train_model()\
+               .predict()\
+               .evaluate()\
+               .plot_result()
+        
+        print("\n" + "="*60)
+        print("项目运行完成！")
+        print("="*60)
+        print("输出文件清单：")
+        print("- 预测可视化图：results/arima_train_test_fitting.png")
+        
+    except Exception as e:
+        print(f"\n运行失败：{str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
