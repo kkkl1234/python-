@@ -1,0 +1,400 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error
+import random
+from tqdm import tqdm
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# 基础配置
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+os.makedirs("multi_zone_best_model", exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 评估指标函数
+def calculate_mae(y_true, y_pred):
+    return mean_absolute_error(y_true, y_pred)
+
+def calculate_mape(y_true, y_pred, epsilon=1e-8):
+    y_true = np.array(y_true) + epsilon
+    y_pred = np.array(y_pred)
+    return round(np.mean(np.abs((y_true - y_pred) / y_true)) * 100, 4)
+
+def calculate_multi_zone_metrics(true_dict, pred_dict):
+    metrics = {}
+    mae_list, mape_list = [], []
+    for zone in ['z1', 'z2', 'z3']:
+        mae = calculate_mae(true_dict[zone], pred_dict[zone])
+        mape = calculate_mape(true_dict[zone], pred_dict[zone])
+        metrics[f'{zone}_mae'], metrics[f'{zone}_mape'] = mae, mape
+        mae_list.append(mae), mape_list.append(mape)
+    metrics['avg_mae'], metrics['avg_mape'] = np.mean(mae_list), np.mean(mape_list)
+    return metrics
+
+# 多区域数据集类
+class MultiZoneTimeSeriesDataset(Dataset):
+    def __init__(self, multi_zone_data, seq_len, pred_len=1):
+        self.multi_zone_data = multi_zone_data
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        
+        if len(multi_zone_data) < seq_len + pred_len:
+            raise ValueError(f"数据长度不足（需≥{seq_len+pred_len}，实际{len(multi_zone_data)}）")
+        self.length = len(multi_zone_data) - seq_len - pred_len + 1
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.length:
+            raise IndexError(f"索引{idx}超出范围（0-{self.length-1}）")
+        x = self.multi_zone_data[idx:idx+self.seq_len]
+        y = self.multi_zone_data[idx+self.seq_len : idx+self.seq_len+self.pred_len]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+# 多区域CNN-Transformer模型类
+class MultiZoneCNNTransformer(nn.Module):
+    def __init__(self, input_dim=3, hidden_dim=64, num_heads=4, num_transformer_layers=2, kernel_size=3, pred_len=1):
+        super().__init__()
+        self.pred_len = pred_len
+        
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim({hidden_dim})必须能被num_heads({num_heads})整除")
+        
+        self.cnn = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size, padding=kernel_size-1, dilation=1),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=2*(kernel_size-1), dilation=2),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        self.transformer_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim*4,
+                batch_first=True, norm_first=True, dropout=0.1
+            ),
+            num_layers=num_transformer_layers
+        )
+        
+        self.fc = nn.Linear(hidden_dim, pred_len * input_dim)
+
+    def forward(self, x):
+        x_cnn = x.transpose(1, 2)
+        x_cnn = self.cnn(x_cnn).transpose(1, 2)
+        x_trans = self.transformer_encoder(x_cnn)
+        out = self.fc(x_trans[:, -1, :])
+        return out.reshape(-1, self.pred_len, 3)
+
+# 数据加载函数
+def load_data(data_path):
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"数据文件不存在：{data_path}")
+    
+    df = pd.read_csv(data_path, parse_dates=['date'], index_col='date')
+    df_daily_mean = df.resample('D').mean().dropna()
+    
+    ZONE_COLS = {
+        'z1': 'Zone 1 Power Consumption',
+        'z2': 'Zone 2  Power Consumption',
+        'z3': 'Zone 3  Power Consumption'
+    }
+    
+    missing_cols = [col for col in ZONE_COLS.values() if col not in df_daily_mean.columns]
+    if missing_cols:
+        raise ValueError(f"数据缺失列：{missing_cols}")
+    
+    print(f"数据加载完成：日均值数据形状={df_daily_mean.shape}")
+    return df_daily_mean, ZONE_COLS
+
+# 数据预处理函数
+def preprocess_data(df_daily_mean, ZONE_COLS):
+    # 提取原始序列与差分
+    raw_zones = {}
+    diff_zones = {}
+    for zone, col in ZONE_COLS.items():
+        raw_zones[zone] = df_daily_mean[col].copy()
+        diff_zones[zone] = raw_zones[zone].diff(1).dropna()
+    
+    # 对齐时间索引
+    common_idx = diff_zones['z1'].index.intersection(diff_zones['z2'].index).intersection(diff_zones['z3'].index)
+    for zone in diff_zones.keys():
+        diff_zones[zone] = diff_zones[zone].loc[common_idx]
+    
+    # 标准化
+    scalers = {}
+    scaled_diff_zones = {}
+    for zone in diff_zones.keys():
+        scalers[zone] = StandardScaler()
+        scaled_diff_zones[zone] = scalers[zone].fit_transform(diff_zones[zone].values.reshape(-1,1)).flatten()
+    
+    # 构建多区域矩阵
+    multi_zone_data = np.column_stack([
+        scaled_diff_zones['z1'], scaled_diff_zones['z2'], scaled_diff_zones['z3']
+    ])
+    
+    # 划分训练/测试集
+    train_size = int(0.8 * len(multi_zone_data))
+    train_data = multi_zone_data[:train_size]
+    test_data = multi_zone_data[train_size:]
+    
+    print(f"数据预处理完成：训练集{len(train_data)}条 | 测试集{len(test_data)}条")
+    return train_data, test_data, scalers, raw_zones
+
+# 预测与逆变换函数
+def predict_multi_zone(model, loader):
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            pred = model(x)
+            preds.extend(pred.cpu().numpy()), trues.extend(y.cpu().numpy())
+    return np.concatenate(preds, axis=0), np.concatenate(trues, axis=0)
+
+def inverse_transform_multi_zone(scaled_diff, zone, scalers, raw_zones, seq_len, train_size, is_train=True):
+    diff = scalers[zone].inverse_transform(scaled_diff.reshape(-1,1)).flatten()
+    start_idx = seq_len if is_train else train_size + seq_len
+    prev_raw_vals = raw_zones[zone].iloc[start_idx-1 : start_idx-1 + len(diff)].values
+    return prev_raw_vals + diff
+
+# 训练评估函数
+def train_eval_multi_zone(params, train_data, test_data, PRED_LEN):
+    try:
+        train_dataset = MultiZoneTimeSeriesDataset(train_data, params['SEQ_LEN'], PRED_LEN)
+        test_dataset = MultiZoneTimeSeriesDataset(test_data, params['SEQ_LEN'], PRED_LEN)
+    except Exception as e:
+        print(f"数据集构建失败：{e}")
+        return float('inf'), {}, None
+    
+    if len(train_dataset) < 10 or len(test_dataset) < 5:
+        return float('inf'), {}, None
+    
+    train_loader = DataLoader(train_dataset, batch_size=params['BATCH_SIZE'], shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=params['BATCH_SIZE'], shuffle=False)
+    
+    model = MultiZoneCNNTransformer(
+        input_dim=3,
+        hidden_dim=params['hidden_dim'],
+        num_heads=params['num_heads'],
+        num_transformer_layers=params['num_transformer_layers'],
+        kernel_size=params['kernel_size'],
+        pred_len=PRED_LEN
+    ).to(DEVICE)
+    
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=params['LEARNING_RATE'], weight_decay=1e-5)
+    EPOCHS_BASE = 40
+    
+    # 训练
+    for _ in range(EPOCHS_BASE):
+        model.train()
+        for x_batch, y_batch in train_loader:
+            x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
+            y_pred = model(x_batch)
+            loss = criterion(y_pred, y_batch)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+    
+    # 测试集预测
+    test_pred_scaled, test_true_scaled = predict_multi_zone(model, test_loader)
+    return test_pred_scaled, test_true_scaled, model
+
+# 可视化函数
+def visualize_results(best_params, best_model, train_data, test_data, scalers, raw_zones, PRED_LEN):
+    # 构建最优模型数据集
+    best_train_dataset = MultiZoneTimeSeriesDataset(train_data, best_params['SEQ_LEN'], PRED_LEN)
+    best_test_dataset = MultiZoneTimeSeriesDataset(test_data, best_params['SEQ_LEN'], PRED_LEN)
+    best_train_loader = DataLoader(best_train_dataset, batch_size=best_params['BATCH_SIZE'], shuffle=False)
+    best_test_loader = DataLoader(best_test_dataset, batch_size=best_params['BATCH_SIZE'], shuffle=False)
+    
+    # 预测
+    train_pred_scaled, train_true_scaled = predict_multi_zone(best_model, best_train_loader)
+    test_pred_scaled, test_true_scaled = predict_multi_zone(best_model, best_test_loader)
+    
+    # 逆变换
+    zone_idx = {'z1':0, 'z2':1, 'z3':2}
+    train_true, train_pred = {}, {}
+    test_true, test_pred = {}, {}
+    train_size = len(train_data)
+    
+    for zone, idx in zone_idx.items():
+        train_true[zone] = inverse_transform_multi_zone(
+            train_true_scaled[:, idx], zone, scalers, raw_zones, best_params['SEQ_LEN'], train_size, is_train=True
+        )
+        train_pred[zone] = inverse_transform_multi_zone(
+            train_pred_scaled[:, idx], zone, scalers, raw_zones, best_params['SEQ_LEN'], train_size, is_train=True
+        )
+        test_true[zone] = inverse_transform_multi_zone(
+            test_true_scaled[:, idx], zone, scalers, raw_zones, best_params['SEQ_LEN'], train_size, is_train=False
+        )
+        test_pred[zone] = inverse_transform_multi_zone(
+            test_pred_scaled[:, idx], zone, scalers, raw_zones, best_params['SEQ_LEN'], train_size, is_train=False
+        )
+    
+    # 计算指标
+    train_metrics = calculate_multi_zone_metrics(train_true, train_pred)
+    test_metrics = calculate_multi_zone_metrics(test_true, test_pred)
+    
+    # 绘制图表
+    fig, axes = plt.subplots(3, 1, figsize=(18, 15), sharex=True)
+    zones = ['z1', 'z2', 'z3']
+    zone_names = ['Zone 1', 'Zone 2', 'Zone 3']
+    colors = ['#2E86AB', '#F2A154', '#E63946']
+    
+    for i, (zone, zone_name) in enumerate(zip(zones, zone_names)):
+        ax = axes[i]
+        train_steps = range(len(train_true[zone]))
+        test_steps = range(len(train_true[zone]), len(train_true[zone]) + len(test_true[zone]))
+        
+        ax.plot(train_steps, train_true[zone], color=colors[0], linewidth=2.0, 
+                label=f'训练集真实值 (MAE={train_metrics[f"{zone}_mae"]:.2f} kW)', alpha=0.8)
+        ax.plot(train_steps, train_pred[zone], color=colors[1], linewidth=1.8, 
+                label='训练集预测值', linestyle='-', alpha=0.9)
+        ax.plot(test_steps, test_true[zone], color=colors[0], linewidth=2.5, 
+                label=f'测试集真实值 (MAE={test_metrics[f"{zone}_mae"]:.2f} kW)', alpha=0.8)
+        ax.plot(test_steps, test_pred[zone], color=colors[2], linewidth=2.2, 
+                label='测试集预测值', linestyle='--', alpha=0.9)
+        ax.axvline(x=len(train_true[zone]), color='black', linestyle=':', linewidth=2.5, label='训练/测试集分割线')
+        
+        ax.set_title(f'{zone_name} 电力消耗 - 多区域联合预测结果', fontsize=14, fontweight='bold', pad=10)
+        ax.set_ylabel('电力消耗 (kW)', fontsize=12)
+        ax.tick_params(axis='x', labelsize=10), ax.tick_params(axis='y', labelsize=10)
+        ax.grid(True, alpha=0.3, linestyle='--'), ax.legend(loc='upper right', fontsize=10)
+    
+    fig.suptitle('Zone 1/2/3 电力消耗多区域联合预测结果', fontsize=18, fontweight='bold', y=0.98)
+    axes[-1].set_xlabel('时间步（按日期顺序）', fontsize=14)
+    plt.tight_layout()
+    plt.savefig("multi_zone_best_model/multi_zone_prediction.png", bbox_inches='tight', dpi=300)
+    plt.show()
+    
+    return train_metrics, test_metrics
+
+# 主函数
+def main():
+    print("="*60)
+    print("多区域电力消耗联合预测")
+    print("="*60)
+    
+    # 配置参数
+    DATA_PATH = "consumption.csv"
+    PRED_LEN = 1
+    
+    # 超参数搜索空间
+    param_grid = {
+        'SEQ_LEN': [7, 14, 21, 28],
+        'hidden_dim': [32, 64, 128, 256],
+        'num_heads': [2, 4, 8, 16],
+        'num_transformer_layers': [1, 2, 3, 4],
+        'kernel_size': [3, 5, 7],
+        'BATCH_SIZE': [8, 16, 32, 64],
+        'LEARNING_RATE': [5e-5, 1e-4, 5e-4, 1e-3]
+    }
+    
+    # 生成20组有效参数
+    n_trials = 20
+    random_params = []
+    while len(random_params) < n_trials:
+        params = {k: random.choice(v) for k, v in param_grid.items()}
+        if params['hidden_dim'] % params['num_heads'] == 0 and params['SEQ_LEN'] <= len(train_data)/10:
+            random_params.append(params)
+    
+    try:
+        # 数据加载与预处理
+        df_daily_mean, ZONE_COLS = load_data(DATA_PATH)
+        train_data, test_data, scalers, raw_zones = preprocess_data(df_daily_mean, ZONE_COLS)
+        
+        # 超参数搜索
+        print("\n===== 开始20组超参数随机搜索 =====")
+        best_mae = float('inf')
+        best_params = None
+        best_model = None
+        
+        for i, params in enumerate(tqdm(random_params, desc="调参进度")):
+            try:
+                test_pred_scaled, test_true_scaled, model = train_eval_multi_zone(params, train_data, test_data, PRED_LEN)
+                if test_pred_scaled.size == 0:
+                    continue
+                
+                # 计算指标
+                test_true = {}
+                test_pred = {}
+                zone_idx = {'z1':0, 'z2':1, 'z3':2}
+                train_size = len(train_data)
+                
+                for zone, idx in zone_idx.items():
+                    test_true[zone] = inverse_transform_multi_zone(
+                        test_true_scaled[:, idx], zone, scalers, raw_zones, params['SEQ_LEN'], train_size, is_train=False
+                    )
+                    test_pred[zone] = inverse_transform_multi_zone(
+                        test_pred_scaled[:, idx], zone, scalers, raw_zones, params['SEQ_LEN'], train_size, is_train=False
+                    )
+                
+                metrics = calculate_multi_zone_metrics(test_true, test_pred)
+                print(f"第{i+1}组：平均MAE={metrics['avg_mae']:.6f} | 平均MAPE={metrics['avg_mape']:.4f}%")
+                
+                if metrics['avg_mae'] < best_mae:
+                    best_mae = metrics['avg_mae']
+                    best_params = params
+                    best_model = model
+            
+            except Exception as e:
+                print(f"第{i+1}组参数训练失败：{str(e)}")
+                continue
+        
+        # 最优模型结果
+        print("\n" + "="*120)
+        print("多区域联合预测最优模型结果汇总")
+        print("="*120)
+        print(f"最优参数组合：")
+        for k, v in best_params.items():
+            print(f"  - {k}: {v}")
+        
+        # 可视化与保存
+        train_metrics, test_metrics = visualize_results(best_params, best_model, train_data, test_data, scalers, raw_zones, PRED_LEN)
+        
+        print(f"\n📊 最终指标：")
+        print(f"训练集 - 平均MAE：{train_metrics['avg_mae']:.6f} kW | 平均MAPE：{train_metrics['avg_mape']:.4f}%")
+        print(f"测试集 - 平均MAE：{test_metrics['avg_mae']:.6f} kW | 平均MAPE：{test_metrics['avg_mape']:.4f}%")
+        
+        # 保存模型
+        torch.save({
+            'model_state_dict': best_model.state_dict(),
+            'params': best_params,
+            'scalers': scalers,
+            'raw_zones': raw_zones,
+            'train_metrics': train_metrics,
+            'test_metrics': test_metrics,
+            'zone_cols': ZONE_COLS
+        }, "multi_zone_best_model/best_multi_zone_cnn_transformer_model.pth")
+        
+        print(f"\n💾 模型已保存至：multi_zone_best_model/best_multi_zone_cnn_transformer_model.pth")
+        print(f"📈 可视化图已保存至：multi_zone_best_model/multi_zone_prediction.png")
+    
+    except Exception as e:
+        print(f"\n运行失败：{str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
