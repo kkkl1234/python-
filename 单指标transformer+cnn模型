@@ -80,14 +80,16 @@ class CNNTransformerModel(nn.Module):
 # -------------------------- 数据加载 --------------------------
 def load_public_data():
     data_path = "consumption.csv"
-    df = pd.read_csv(data_path, sep=';', low_memory=False)
+    df = pd.read_csv(data_path)
     
-    df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
-    df = df.dropna(subset=['datetime']).set_index('datetime')
-    df['Global_active_power'] = pd.to_numeric(df['Global_active_power'], errors='coerce')
-    df_daily = df['Global_active_power'].resample('D').mean().dropna()
-    print("公开数据集加载成功")
-    return df_daily
+    df["DateTime"] = pd.to_datetime(df["DateTime"])  
+    df.set_index("DateTime", inplace=True)  
+    
+    df_daily_mean = df.resample('D').mean() 
+    # 新增：提取预测目标列，保留单变量时间序列
+    target_col = "Zone 3  Power Consumption"
+    df_daily_mean = df_daily_mean[[target_col]]  # 只保留目标列，形状变为(364,1)
+    return df_daily_mean
 
 # -------------------------- 探索性数据分析 --------------------------
 def exploratory_data_analysis(df):
@@ -98,16 +100,18 @@ def exploratory_data_analysis(df):
     print("\n描述统计：")
     print(df.describe().round(2))
     
-    # 时间序列图
+    # 时间序列图：修复多列数据问题，只取第一列（电力消耗列）进行绘图
     plt.figure(figsize=(15, 5))
-    plt.plot(df.index, df.values, color='#2E86AB', linewidth=1.5)
+    # 修改点1：使用df.iloc[:, 0]获取单列数据，避免多数据集
+    plt.plot(df.index, df.iloc[:, 0].values, color='#2E86AB', linewidth=1.5)
     plt.title('日均电力消耗时间序列', fontsize=14, fontweight='bold')
     plt.xlabel('日期'), plt.ylabel('电力消耗 (kW)'), plt.grid(alpha=0.3)
     plt.tight_layout(), plt.savefig("eda_plots/time_series.png", dpi=300), plt.close()
     
-    # 分布直方图
+    # 分布直方图：修复多列数据问题，只取第一列展平为一维数组
     plt.figure(figsize=(10, 6))
-    plt.hist(df.values, bins=30, color='#F2A154', alpha=0.7, edgecolor='black')
+    # 修改点2：使用df.iloc[:, 0].values.flatten()获取单组数据
+    plt.hist(df.iloc[:, 0].values.flatten(), bins=30, color='#F2A154', alpha=0.7, edgecolor='black')
     plt.title('电力消耗分布', fontsize=14, fontweight='bold')
     plt.xlabel('电力消耗 (kW)'), plt.ylabel('频数'), plt.grid(alpha=0.3)
     plt.tight_layout(), plt.savefig("eda_plots/distribution.png", dpi=300), plt.close()
@@ -116,15 +120,16 @@ def exploratory_data_analysis(df):
 
 # -------------------------- 数据预处理 --------------------------
 def preprocess_data(df):
-    # 一阶差分平稳化
-    diff_series = df.diff(1).dropna()
-    # 标准化处理
+    # 一阶差分平稳化（此时df是(364,1)，差分后为(363,1)）
+    diff_series = df.diff(1).dropna()  # 形状(363,1)
+    # 标准化处理：直接对(363,1)的差分序列处理，无需reshape(-1,1)
     scaler = StandardScaler()
-    diff_series_scaled = scaler.fit_transform(diff_series.values.reshape(-1, 1)).flatten()
-    # 训练/测试集划分
-    train_size = int(0.8 * len(diff_series_scaled))
-    train_data = diff_series_scaled[:train_size]
-    test_data = diff_series_scaled[train_size:]
+    diff_series_scaled = scaler.fit_transform(diff_series).flatten()  # 形状(363,)
+    
+    # 训练/测试集划分（基于真实的363条时序数据）
+    train_size = int(0.8 * len(diff_series_scaled))  # 0.8×363≈290
+    train_data = diff_series_scaled[:train_size]     # 约290条
+    test_data = diff_series_scaled[train_size:]      # 约73条
     
     print(f"数据预处理完成：训练集{len(train_data)}条 | 测试集{len(test_data)}条")
     return train_data, test_data, scaler, diff_series.index
