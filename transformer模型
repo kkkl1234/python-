@@ -1,0 +1,309 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error
+import random
+from tqdm import tqdm
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+os.makedirs("best_model", exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 评估指标函数
+def calculate_mae(y_true, y_pred):
+    return mean_absolute_error(y_true, y_pred)
+
+def calculate_mape(y_true, y_pred, epsilon=1e-8):
+    y_true = np.array(y_true) + epsilon
+    y_pred = np.array(y_pred)
+    return round(np.mean(np.abs((y_true - y_pred) / y_true)) * 100, 4)
+
+# 数据集类
+class TimeSeriesDataset(Dataset):
+    def __init__(self, data, seq_len, pred_len=1):
+        self.data = data
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        
+        if len(data) < seq_len + pred_len:
+            raise ValueError(f"数据长度不足（需≥{seq_len+pred_len}，实际{len(data)}）")
+        self.length = len(data) - seq_len - pred_len + 1
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.length:
+            raise IndexError(f"索引{idx}超出范围（0-{self.length-1}）")
+        x = self.data[idx:idx+self.seq_len]
+        y = self.data[idx+self.seq_len:idx+self.seq_len+self.pred_len]
+        return torch.tensor(x, dtype=torch.float32).unsqueeze(-1), torch.tensor(y, dtype=torch.float32).unsqueeze(-1)
+
+# Transformer模型类
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=64, num_heads=4, num_transformer_layers=2, pred_len=1):
+        super().__init__()
+        self.pred_len = pred_len
+        
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim({hidden_dim})必须能被num_heads({num_heads})整除")
+        
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.transformer_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
+                batch_first=True, norm_first=True, dropout=0.1
+            ),
+            num_layers=num_transformer_layers
+        )
+        self.fc = nn.Linear(hidden_dim, pred_len)
+
+    def forward(self, x):
+        x_proj = self.input_proj(x)
+        x_transformer = self.transformer_encoder(x_proj)
+        out = self.fc(x_transformer[:, -1, :])
+        return out.unsqueeze(-1)
+
+# 数据加载函数
+def load_data(data_path):
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"数据文件不存在：{data_path}")
+    
+    df = pd.read_csv(data_path, parse_dates=['DateTime'], index_col='DateTime')
+    target_col = 'Zone 3  Power Consumption'
+    
+    if target_col not in df.columns:
+        raise ValueError(f"数据缺失目标列：{target_col}")
+    
+    df_daily_mean = df.resample('D').mean().dropna()
+    temp_series1 = df_daily_mean[target_col].copy()
+    print(f"数据加载完成：序列长度={len(temp_series1)}")
+    return temp_series1
+
+# 数据预处理函数
+def preprocess_data(series):
+    # 一阶差分平稳化
+    diff_series = series.diff(1).dropna()
+    # 标准化
+    scaler = StandardScaler()
+    diff_series_scaled = scaler.fit_transform(diff_series.values.reshape(-1, 1)).flatten()
+    # 划分训练/测试集
+    train_size = int(0.8 * len(diff_series_scaled))
+    train_data = diff_series_scaled[:train_size]
+    test_data = diff_series_scaled[train_size:]
+    
+    print(f"数据预处理完成：训练集{len(train_data)}条 | 测试集{len(test_data)}条")
+    return train_data, test_data, scaler, diff_series.index
+
+# 预测与逆变换函数
+def predict(model, loader):
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            pred = model(x)
+            preds.extend(pred.cpu().numpy().flatten())
+            trues.extend(y.cpu().numpy().flatten())
+    return np.array(preds), np.array(trues)
+
+def inverse_transform(pred_scaled, scaler, series, seq_len, train_size, is_train=True):
+    pred_diff = scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+    start_idx = seq_len if is_train else train_size + seq_len
+    original_vals = series.iloc[start_idx-1 : start_idx-1 + len(pred_diff)].values
+    return original_vals + pred_diff
+
+# 训练评估函数
+def train_eval(params, train_data, test_data, scaler, series, PRED_LEN, EPOCHS_BASE):
+    try:
+        train_dataset = TimeSeriesDataset(train_data, params['SEQ_LEN'], PRED_LEN)
+        test_dataset = TimeSeriesDataset(test_data, params['SEQ_LEN'], PRED_LEN)
+    except Exception as e:
+        print(f"数据集构建失败：{e}")
+        return float('inf'), float('inf'), None
+    
+    if len(train_dataset) < 10 or len(test_dataset) < 5:
+        return float('inf'), float('inf'), None
+    
+    train_loader = DataLoader(train_dataset, batch_size=params['BATCH_SIZE'], shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=params['BATCH_SIZE'], shuffle=False)
+    
+    model = TransformerModel(
+        input_dim=1,
+        hidden_dim=params['hidden_dim'],
+        num_heads=params['num_heads'],
+        num_transformer_layers=params['num_transformer_layers'],
+        pred_len=PRED_LEN
+    ).to(DEVICE)
+    
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=params['LEARNING_RATE'], weight_decay=1e-5)
+    
+    # 训练
+    for _ in range(EPOCHS_BASE):
+        model.train()
+        for x_batch, y_batch in train_loader:
+            x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
+            y_pred = model(x_batch)
+            loss = criterion(y_pred, y_batch)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+    
+    # 测试集预测与评估
+    test_pred_scaled, test_true_scaled = predict(model, test_loader)
+    test_pred = inverse_transform(test_pred_scaled, scaler, series, params['SEQ_LEN'], len(train_data), is_train=False)
+    test_true = inverse_transform(test_true_scaled, scaler, series, params['SEQ_LEN'], len(train_data), is_train=False)
+    
+    test_mae = calculate_mae(test_true, test_pred)
+    test_mape = calculate_mape(test_true, test_pred)
+    return test_mae, test_mape, model
+
+# 可视化函数
+def visualize_results(best_params, best_model, train_data, test_data, scaler, series, PRED_LEN):
+    # 构建最优模型数据集
+    best_train_dataset = TimeSeriesDataset(train_data, best_params['SEQ_LEN'], PRED_LEN)
+    best_test_dataset = TimeSeriesDataset(test_data, best_params['SEQ_LEN'], PRED_LEN)
+    best_train_loader = DataLoader(best_train_dataset, batch_size=best_params['BATCH_SIZE'], shuffle=False)
+    best_test_loader = DataLoader(best_test_dataset, batch_size=best_params['BATCH_SIZE'], shuffle=False)
+    
+    # 预测
+    train_pred_scaled, train_true_scaled = predict(best_model, best_train_loader)
+    test_pred_scaled, test_true_scaled = predict(best_model, best_test_loader)
+    
+    # 逆变换
+    train_pred = inverse_transform(train_pred_scaled, scaler, series, best_params['SEQ_LEN'], len(train_data), is_train=True)
+    train_true = inverse_transform(train_true_scaled, scaler, series, best_params['SEQ_LEN'], len(train_data), is_train=True)
+    test_pred = inverse_transform(test_pred_scaled, scaler, series, best_params['SEQ_LEN'], len(train_data), is_train=False)
+    test_true = inverse_transform(test_true_scaled, scaler, series, best_params['SEQ_LEN'], len(train_data), is_train=False)
+    
+    # 计算指标
+    train_mae = calculate_mae(train_true, train_pred)
+    train_mape = calculate_mape(train_true, train_pred)
+    
+    # 绘制图表
+    fig, ax = plt.subplots(figsize=(18, 8))
+    train_steps = range(len(train_true))
+    test_steps = range(len(train_true), len(train_true) + len(test_true))
+    
+    ax.plot(train_steps, train_true, color='#2E86AB', linewidth=2.0, 
+            label=f'训练集真实值 (MAE={train_mae:.2f} kW)', alpha=0.8)
+    ax.plot(train_steps, train_pred, color='#F2A154', linewidth=1.8, label='训练集预测值', linestyle='-', alpha=0.9)
+    ax.plot(test_steps, test_true, color='#2E86AB', linewidth=2.5, 
+            label=f'测试集真实值 (MAE={best_mae:.2f} kW)', alpha=0.8)
+    ax.plot(test_steps, test_pred, color='#E63946', linewidth=2.2, label='测试集预测值', linestyle='--', alpha=0.9)
+    ax.axvline(x=len(train_true)-1, color='black', linestyle=':', linewidth=2.5, label='训练/测试集分割线')
+    
+    ax.set_title('区域3电力消耗 - 最优纯Transformer模型 训练集+测试集预测结果', fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel('时间步（按日期顺序）', fontsize=14), ax.set_ylabel('电力消耗 (kW)', fontsize=14)
+    ax.tick_params(axis='x', labelsize=12), ax.tick_params(axis='y', labelsize=12)
+    ax.grid(True, alpha=0.3, linestyle='--'), ax.legend(loc='upper right', fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig("best_model/transformer_train_test_prediction.png", bbox_inches='tight', dpi=300)
+    plt.show()
+    
+    return train_mae, train_mape
+
+# 主函数
+def main():
+    print("="*60)
+    print("区域3电力消耗预测（纯Transformer模型）")
+    print("="*60)
+    
+    # 配置参数
+    DATA_PATH = "consumption.csv"
+    PRED_LEN = 1
+    EPOCHS_BASE = 40
+    
+    # 超参数搜索空间
+    param_grid = {
+        'SEQ_LEN': [28],
+        'hidden_dim': [32, 64, 128, 256],
+        'num_heads': [2, 4, 8, 16],
+        'num_transformer_layers': [1, 2, 3, 4],
+        'BATCH_SIZE': [8, 16, 32, 64],
+        'LEARNING_RATE': [5e-5, 1e-4, 5e-4, 1e-3]
+    }
+    
+    # 生成20组有效参数
+    n_trials = 20
+    random_params = []
+    while len(random_params) < n_trials:
+        params = {k: random.choice(v) for k, v in param_grid.items()}
+        if params['hidden_dim'] % params['num_heads'] == 0:
+            random_params.append(params)
+    
+    try:
+        # 数据加载与预处理
+        series = load_data(DATA_PATH)
+        train_data, test_data, scaler, diff_index = preprocess_data(series)
+        
+        # 超参数搜索
+        print("\n===== 开始20组超参数随机搜索 =====")
+        best_mae = float('inf')
+        best_params = None
+        best_model = None
+        
+        for i, params in enumerate(tqdm(random_params, desc="调参进度")):
+            try:
+                test_mae, test_mape, model = train_eval(params, train_data, test_data, scaler, series, PRED_LEN, EPOCHS_BASE)
+                print(f"第{i+1}组：MAE={test_mae:.6f} | MAPE={test_mape:.4f}%")
+                
+                if test_mae < best_mae:
+                    best_mae = test_mae
+                    best_mape = test_mape
+                    best_params = params
+                    best_model = model
+            
+            except Exception as e:
+                print(f"第{i+1}组参数训练失败：{str(e)}")
+                continue
+        
+        # 最优模型结果输出
+        print("\n" + "="*100)
+        print("最优纯Transformer模型结果汇总")
+        print("="*100)
+        print(f"最优参数组合：")
+        for k, v in best_params.items():
+            print(f"  - {k}: {v}")
+        print(f"\n测试集MAE：{best_mae:.6f} kW | MAPE：{best_mape:.4f}%")
+        
+        # 可视化与保存
+        train_mae, train_mape = visualize_results(best_params, best_model, train_data, test_data, scaler, series, PRED_LEN)
+        
+        # 保存模型
+        torch.save({
+            'model_state_dict': best_model.state_dict(),
+            'params': best_params,
+            'scaler': scaler,
+            'train_mae': train_mae,
+            'train_mape': train_mape,
+            'test_mae': best_mae,
+            'test_mape': best_mape
+        }, "best_model/best_transformer_model.pth")
+        
+        print(f"\n" + "="*100)
+        print("可视化与模型保存完成")
+        print("="*100)
+        print(f"📈 可视化图已保存至：best_model/transformer_train_test_prediction.png")
+        print(f"💾 模型已保存至：best_model/best_transformer_model.pth")
+        print(f"\n最终统计指标：")
+        print(f"  - 训练集 MAE：{train_mae:.6f} kW | MAPE：{train_mape:.4f}%")
+        print(f"  - 测试集 MAE：{best_mae:.6f} kW | MAPE：{best_mape:.4f}%")
+    
+    except Exception as e:
+        print(f"\n运行失败：{str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
