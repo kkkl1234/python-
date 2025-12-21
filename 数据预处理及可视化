@@ -1,0 +1,248 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+import os
+from typing import List, Tuple, Dict
+
+# -------------------------- 1. 全局配置--------------------------
+# 字体与显示配置（解决中文乱码）
+plt.rcParams['font.sans-serif'] = ['Hiragino Sans GB', 'STHeiti', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+os.makedirs("visualization_results", exist_ok=True)
+
+# 固定配置
+POWER_CONFIGS = [
+    ("Zone 1 Power Consumption", "区域1电力消耗 (kW)", "#45B7D1"),
+    ("Zone 2  Power Consumption", "区域2电力消耗 (kW)", "#45B7D1"),  # 列名含2个空格
+    ("Zone 3  Power Consumption", "区域3电力消耗 (kW)", "#45B7D1")   # 列名含2个空格
+]
+FEATURE_COLS = [
+    'Temperature', 'Humidity', 'Wind Speed', 
+    'general diffuse flows', 'diffuse flows'
+]
+UNIT_MAP = {
+    'Temperature': '°C',
+    'Humidity': '%',
+    'Wind Speed': 'm/s',
+    'general diffuse flows': 'W/m²',
+    'diffuse flows': 'W/m²'
+}
+
+# -------------------------- 2. 类定义 --------------------------
+class PowerConsumptionAnalyzer:
+    def __init__(self, data_path: str = "consumption.csv"):
+        self.data_path = data_path
+        self.df_raw = None  # 原始数据
+        self.df_processed = None  # 日期索引处理后的数据
+        self.df_daily_mean = None  # 日均值数据
+        self.feature_data = None  # 特征数据（用于后续算法）
+
+    def load_data(self) -> None:
+        try:
+            # 检查文件是否存在
+            if not os.path.exists(self.data_path):
+                raise FileNotFoundError(f"数据文件不存在：{self.data_path}")
+            
+            # 读取数据
+            self.df_raw = pd.read_csv(self.data_path)
+            print(f"✅ 成功加载原始数据，形状：{self.df_raw.shape}")
+            
+            # 检查必要列是否存在
+            required_cols = ["DateTime"] + [cfg[0] for cfg in POWER_CONFIGS] + FEATURE_COLS
+            missing_cols = [col for col in required_cols if col not in self.df_raw.columns]
+            if missing_cols:
+                raise ValueError(f"数据缺失必要列：{missing_cols}")
+        
+        except Exception as e:
+            raise RuntimeError(f"❌ 数据加载失败：{str(e)}")
+
+    def process_data(self) -> None:
+        if self.df_raw is None:
+            raise ValueError("请先调用 load_data() 加载数据")
+        
+        try:
+            # 日期转换与索引设置
+            self.df_processed = self.df_raw.copy()
+            self.df_processed["DateTime"] = pd.to_datetime(self.df_processed["DateTime"], errors='coerce')
+            
+            # 检查日期转换有效性
+            invalid_date_count = self.df_processed["DateTime"].isnull().sum()
+            if invalid_date_count > 0:
+                raise ValueError(f"日期转换失败，共{invalid_date_count}条无效日期数据")
+            
+            self.df_processed.set_index("DateTime", inplace=True)
+            
+            # 日均值重采样
+            self.df_daily_mean = self.df_processed.resample('D').mean()
+            
+            # 检查重采样后数据有效性
+            if self.df_daily_mean.empty:
+                raise ValueError("日均值重采样后数据为空，请检查原始数据时间范围")
+            
+            # 处理特征列缺失值（用户指定逻辑）
+            self.feature_data = self.df_daily_mean[FEATURE_COLS].fillna(method='ffill').fillna(method='bfill')
+            
+            print(f"✅ 数据预处理完成")
+            print(f"  - 处理后数据形状：{self.df_processed.shape}")
+            print(f"  - 日均值数据形状：{self.df_daily_mean.shape}")
+            print(f"  - 特征数据形状：{self.feature_data.shape}")
+        
+        except Exception as e:
+            raise RuntimeError(f"❌ 数据预处理失败：{str(e)}")
+
+    def plot_power_time_series(self) -> None:
+        """绘制3个区域电力消耗日均值时序图"""
+        if self.df_daily_mean is None:
+            raise ValueError("请先调用 process_data() 处理数据")
+        
+        # 创建3行1列子图
+        fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(14, 12), sharex=True)
+        
+        # 遍历每个区域绘制
+        for idx, (col_name, chinese_name, color) in enumerate(POWER_CONFIGS):
+            ax = axes[idx]
+            # 绘制时序曲线（含圆点优化）
+            ax.plot(
+                self.df_daily_mean.index, self.df_daily_mean[col_name],
+                color=color, linewidth=2.5, alpha=0.9,
+                markersize=5, markerfacecolor='white', markeredgewidth=1.5
+            )
+            
+            # 图表样式配置
+            ax.set_title(f"{chinese_name}（日均值时间序列）", fontsize=15, fontweight="bold", pad=15)
+            ax.set_ylabel(chinese_name.split(" ")[-1], fontsize=11, fontweight="medium")
+            ax.tick_params(axis='y', labelsize=10)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            
+            # 调整y轴范围（上下留空5%）
+            y_min = self.df_daily_mean[col_name].min() * 0.95
+            y_max = self.df_daily_mean[col_name].max() * 1.05
+            ax.set_ylim(y_min, y_max)
+            
+            # 最后一个子图显示x轴标签
+            if idx == 2:
+                ax.set_xlabel("日期", fontsize=12, fontweight="medium")
+                ax.tick_params(axis='x', rotation=45, labelsize=10)
+        
+        # 调整x轴范围
+        x_min = self.df_daily_mean.index.min() - pd.Timedelta(days=1)
+        x_max = self.df_daily_mean.index.max() + pd.Timedelta(days=1)
+        for ax in axes:
+            ax.set_xlim(x_min, x_max)
+        
+        # 调整子图间距
+        plt.tight_layout(pad=3.0)
+        plt.savefig("visualization_results/power_daily_mean_series.png", dpi=300, bbox_inches='tight')
+        plt.show()
+        print("✅ 电力消耗时序图已保存至 visualization_results/")
+
+    def plot_feature_time_series(self) -> None:
+        """绘制5个环境特征时序图"""
+        if self.feature_data is None:
+            raise ValueError("请先调用 process_data() 处理数据")
+        
+        # 创建3行2列子图
+        fig, axes = plt.subplots(3, 2, figsize=(16, 10), sharex=True)
+        fig.suptitle('环境特征时序变化趋势', fontsize=18, fontweight='bold', y=0.98)
+        
+        # 子图位置映射（5个特征对应前5个位置）
+        subplot_pos = [(0,0), (0,1), (1,0), (1,1), (2,0)]
+        
+        # 逐个绘制特征
+        for idx, (feat, pos) in enumerate(zip(FEATURE_COLS, subplot_pos)):
+            ax = axes[pos]
+            # 绘制时序曲线（默认颜色）
+            ax.plot(
+                self.feature_data.index, self.feature_data[feat],
+                linewidth=1.8, alpha=0.8, label=feat
+            )
+            # 添加均值线
+            mean_val = self.feature_data[feat].mean()
+            ax.axhline(
+                y=mean_val, color='black', linestyle='--', linewidth=1.2, alpha=0.7,
+                label=f'均值：{mean_val:.2f} {UNIT_MAP.get(feat, "")}'
+            )
+            
+            # 样式配置
+            ax.set_title(feat, fontsize=12, fontweight='medium', pad=8)
+            ax.set_ylabel(f'数值（{UNIT_MAP.get(feat, "无单位")}）', fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.3)
+            ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+            ax.tick_params(axis='y', labelsize=9)
+        
+        # 隐藏最后一个空子图
+        axes[2, 1].axis('off')
+        
+        # 配置x轴标签
+        axes[2, 0].set_xlabel('时间', fontsize=12, fontweight='medium')
+        axes[2, 0].tick_params(axis='x', rotation=45, labelsize=9)
+        
+        # 调整间距（预留标题空间）
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        # 保存图片
+        plt.savefig("visualization_results/feature_time_series.png", dpi=300, bbox_inches='tight')
+        plt.show()
+        print("✅ 特征时序图已保存至 visualization_results/")
+
+    def get_processed_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """获取处理后的数据"""
+        if self.df_daily_mean is None or self.feature_data is None:
+            raise ValueError("请先调用 process_data() 处理数据")
+        return self.df_daily_mean, self.feature_data
+
+# -------------------------- 3. 辅助函数（满足函数调用要求） --------------------------
+def validate_data_quality(df: pd.DataFrame, data_name: str) -> bool:
+    """验证数据质量（独立函数，体现函数调用）"""
+    # 检查数据非空
+    if df.empty:
+        print(f"❌ {data_name} 数据为空")
+        return False
+    # 检查特征列缺失值
+    missing_ratio = df[FEATURE_COLS].isnull().sum() / len(df) * 100
+    high_missing_cols = missing_ratio[missing_ratio > 30].index.tolist()
+    if high_missing_cols:
+        print(f"⚠️ {data_name} 以下特征缺失率超过30%：{high_missing_cols}")
+    return True
+
+# -------------------------- 4. 主函数 --------------------------
+def main():
+    
+    try:
+        # 1. 初始化分析器
+        analyzer = PowerConsumptionAnalyzer(data_path="consumption.csv")
+        
+        # 2. 加载数据
+        analyzer.load_data()
+        
+        # 3. 数据预处理
+        analyzer.process_data()
+        
+        # 4. 验证数据质量
+        df_daily_mean, feature_data = analyzer.get_processed_data()
+        if validate_data_quality(df_daily_mean, "日均值数据") and validate_data_quality(feature_data, "特征数据"):
+            print("✅ 数据质量验证通过")
+        
+        # 5. 绘制可视化图表
+        print("\n📊 开始绘制电力消耗时序图...")
+        analyzer.plot_power_time_series()
+        
+        print("\n📊 开始绘制特征时序图...")
+        analyzer.plot_feature_time_series()
+        
+        print("\n" + "="*60)
+        print("🎉 数据预处理与可视化流程完成！")
+        print("="*60)
+        print("输出文件清单：")
+        print("1. 电力消耗时序图：visualization_results/power_daily_mean_series.png")
+        print("2. 特征时序图：visualization_results/feature_time_series.png")
+    
+    except Exception as e:
+        print(f"\n❌ 流程执行失败：{str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
