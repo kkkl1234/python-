@@ -13,18 +13,6 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# 基础配置
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-set_seed(42)
 os.makedirs("multi_zone_best_model", exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -104,12 +92,22 @@ class MultiZoneCNNTransformer(nn.Module):
         out = self.fc(x_trans[:, -1, :])
         return out.reshape(-1, self.pred_len, 3)
 
-# 数据加载函数
+# 数据加载函数（修正后）
 def load_data(data_path):
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"数据文件不存在：{data_path}")
     
-    df = pd.read_csv(data_path, parse_dates=['date'], index_col='date')
+    # 修正1：使用原始日期列名"DateTime"，而非"date"
+    df = pd.read_csv(data_path)
+    # 手动解析日期列并设置为索引，提高兼容性
+    df["DateTime"] = pd.to_datetime(df["DateTime"], errors='coerce')  # 错误日期转为NaT
+    df = df.dropna(subset=["DateTime"])  # 删除无效日期行
+    df.set_index("DateTime", inplace=True)  # 设置为DatetimeIndex
+    
+    # 修正2：确保索引是时间类型后再重采样
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("索引未成功转为DatetimeIndex，请检查日期列格式")
+    
     df_daily_mean = df.resample('D').mean().dropna()
     
     ZONE_COLS = {
@@ -122,7 +120,7 @@ def load_data(data_path):
     if missing_cols:
         raise ValueError(f"数据缺失列：{missing_cols}")
     
-    print(f"数据加载完成：日均值数据形状={df_daily_mean.shape}")
+    print(f"数据加载完成：日均值数据形状={df_daily_mean.shape} | 索引类型={type(df_daily_mean.index)}")
     return df_daily_mean, ZONE_COLS
 
 # 数据预处理函数
@@ -291,7 +289,7 @@ def visualize_results(best_params, best_model, train_data, test_data, scalers, r
     
     return train_metrics, test_metrics
 
-# 主函数
+# 主函数（修正后）
 def main():
     print("="*60)
     print("多区域电力消耗联合预测")
@@ -301,7 +299,7 @@ def main():
     DATA_PATH = "consumption.csv"
     PRED_LEN = 1
     
-    # 超参数搜索空间
+    # 超参数搜索空间（先定义，不使用train_data）
     param_grid = {
         'SEQ_LEN': [7, 14, 21, 28],
         'hidden_dim': [32, 64, 128, 256],
@@ -312,20 +310,27 @@ def main():
         'LEARNING_RATE': [5e-5, 1e-4, 5e-4, 1e-3]
     }
     
-    # 生成20组有效参数
-    n_trials = 20
-    random_params = []
-    while len(random_params) < n_trials:
-        params = {k: random.choice(v) for k, v in param_grid.items()}
-        if params['hidden_dim'] % params['num_heads'] == 0 and params['SEQ_LEN'] <= len(train_data)/10:
-            random_params.append(params)
-    
     try:
-        # 数据加载与预处理
+        # 第一步：先完成数据加载与预处理（提前获取train_data）
         df_daily_mean, ZONE_COLS = load_data(DATA_PATH)
         train_data, test_data, scalers, raw_zones = preprocess_data(df_daily_mean, ZONE_COLS)
         
-        # 超参数搜索
+        # 第二步：再生成20组有效参数（此时train_data已存在，可正常引用）
+        n_trials = 20
+        random_params = []
+        # 增加容错：避免因train_data过短导致条件无法满足
+        seq_len_upper_limit = max(1, int(len(train_data)/10))
+        print(f"\n生成超参数时，SEQ_LEN上限为：{seq_len_upper_limit}（基于train_data长度{len(train_data)}）")
+        
+        while len(random_params) < n_trials:
+            params = {k: random.choice(v) for k, v in param_grid.items()}
+            # 修正判断条件：使用已存在的train_data，同时增加seq_len合法性判断
+            if (params['hidden_dim'] % params['num_heads'] == 0 and 
+                params['SEQ_LEN'] <= seq_len_upper_limit and
+                params['SEQ_LEN'] >= 1):
+                random_params.append(params)
+        
+        # 第三步：超参数搜索（后续逻辑不变）
         print("\n===== 开始20组超参数随机搜索 =====")
         best_mae = float('inf')
         best_params = None
@@ -363,10 +368,13 @@ def main():
                 print(f"第{i+1}组参数训练失败：{str(e)}")
                 continue
         
-        # 最优模型结果
+        # 最优模型结果（后续逻辑不变）
         print("\n" + "="*120)
         print("多区域联合预测最优模型结果汇总")
         print("="*120)
+        if best_params is None:
+            raise ValueError("未找到有效最优模型，请检查参数范围或数据质量")
+        
         print(f"最优参数组合：")
         for k, v in best_params.items():
             print(f"  - {k}: {v}")
@@ -395,6 +403,3 @@ def main():
     except Exception as e:
         print(f"\n运行失败：{str(e)}")
         raise
-
-if __name__ == "__main__":
-    main()
